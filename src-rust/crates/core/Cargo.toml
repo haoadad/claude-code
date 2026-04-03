@@ -10,7 +10,7 @@ edition.workspace = true
 voice = ["dep:cpal"]
 
 # Experimental/feature-flagged capabilities for free-code builds
-default = ["voice"]
+default = ["voice", "ultraplan"]
 
 # Interaction & UI features
 ultraplan = []

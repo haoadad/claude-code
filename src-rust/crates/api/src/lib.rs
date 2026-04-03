@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 // Modules
 // ---------------------------------------------------------------------------
 pub mod cch;
+pub mod codex_adapter;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -327,6 +328,21 @@ pub struct AvailableModel {
 pub mod client {
     use super::*;
 
+    /// Provider selection for API calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Provider {
+        /// Use Anthropic's API
+        Anthropic,
+        /// Use OpenAI Codex via OAuth
+        Codex,
+    }
+
+    impl Default for Provider {
+        fn default() -> Self {
+            Provider::Anthropic
+        }
+    }
+
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
     pub struct ClientConfig {
@@ -341,6 +357,8 @@ pub mod client {
         /// When true, send `Authorization: Bearer <api_key>` instead of `x-api-key`.
         /// Used for Claude.ai subscription (OAuth user:inference scope) tokens.
         pub use_bearer_auth: bool,
+        /// Which provider to use for API calls.
+        pub provider: Provider,
     }
 
     impl Default for ClientConfig {
@@ -355,6 +373,7 @@ pub mod client {
                 max_retry_delay: Duration::from_secs(60),
                 request_timeout: Duration::from_secs(600),
                 use_bearer_auth: false,
+                provider: Provider::Anthropic,
             }
         }
     }
@@ -402,6 +421,11 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Route to Codex if configured
+            if self.config.provider == Provider::Codex {
+                return self.create_message_codex(&request).await;
+            }
+
             request.stream = false;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
@@ -416,6 +440,49 @@ pub mod client {
             serde_json::from_str(&text).map_err(ClaudeError::Json)
         }
 
+        /// Send a request to OpenAI Codex API instead of Anthropic.
+        async fn create_message_codex(
+            &self,
+            request: &CreateMessageRequest,
+        ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Convert Anthropic format to OpenAI format
+            let openai_req = codex_adapter::anthropic_to_openai_request(request);
+
+            // Send to Codex endpoint
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(codex_adapter::CODEX_RESPONSES_ENDPOINT)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .header("Content-Type", "application/json")
+                .json(&openai_req)
+                .timeout(self.config.request_timeout)
+                .send()
+                .await
+                .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
+
+            let status = resp.status();
+            let text = resp.text().await.map_err(ClaudeError::Http)?;
+
+            if !status.is_success() {
+                return Err(self.parse_api_error(status.as_u16(), &text));
+            }
+
+            // Parse OpenAI response and convert to Anthropic format
+            let openai_resp: Value = serde_json::from_str(&text).map_err(ClaudeError::Json)?;
+            let (content, stop_reason, input_tokens, output_tokens) =
+                codex_adapter::parse_openai_response(&openai_resp);
+
+            let response = codex_adapter::build_anthropic_response(
+                &content,
+                &stop_reason,
+                input_tokens,
+                output_tokens,
+                &request.model,
+            );
+
+            Ok(response)
+        }
+
         // ---- Streaming create message ------------------------------------
 
         /// Send a streaming `POST /v1/messages`.  Events are dispatched to the
@@ -426,6 +493,13 @@ pub mod client {
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
         ) -> Result<mpsc::Receiver<StreamEvent>, ClaudeError> {
+            // Codex provider doesn't support streaming yet
+            if self.config.provider == Provider::Codex {
+                return Err(ClaudeError::Other(
+                    "Codex provider does not support streaming yet".to_string(),
+                ));
+            }
+
             request.stream = true;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 

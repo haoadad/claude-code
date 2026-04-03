@@ -988,13 +988,6 @@ impl NamedCommand for UltraplanCommand {
     fn usage(&self) -> &str { "claude ultraplan [--effort=medium|high|maximum]" }
 
     fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
-        #[cfg(not(feature = "ultraplan"))]
-        {
-            return CommandResult::Error(
-                "Ultraplan is not enabled in this build. Compile with --features ultraplan".to_string(),
-            );
-        }
-
         // Parse effort level from args
         let effort = args.iter()
             .find(|arg| arg.starts_with("--effort="))
